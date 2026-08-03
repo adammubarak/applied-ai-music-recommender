@@ -321,6 +321,10 @@ reliability validation, fallback behavior, structured logging, pipeline
 integration, Streamlit helper functions, a Streamlit interaction test, and
 end-to-end behavior.
 
+A detailed reliability and evaluation report — including the reliability-score
+formula, a per-scenario results table, and quantitative metrics — is available
+in [evaluation_results.md](evaluation_results.md).
+
 All Anthropic interactions are **mocked**. The suite makes **no live network or
 paid API calls**, and the Streamlit server started successfully in a headless
 smoke test.
