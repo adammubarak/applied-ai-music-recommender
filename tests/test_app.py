@@ -205,3 +205,51 @@ def test_streamlit_smoke_apptest():
     labels = [b.label for b in at.button]
     assert any("Generate" in lbl for lbl in labels)
     # Initial render performs no discovery (button not clicked) -> no AI path.
+
+
+def _apptest_text(at) -> str:
+    """Concatenate visible text from common AppTest element collections."""
+    parts = []
+    for name in ("title", "header", "subheader", "markdown", "caption",
+                 "info", "warning", "error", "success"):
+        for el in getattr(at, name, []):
+            val = getattr(el, "value", None)
+            if isinstance(val, str):
+                parts.append(val)
+    for m in getattr(at, "metric", []):
+        parts.append(f"{getattr(m, 'label', '')} {getattr(m, 'value', '')}")
+    return "\n".join(parts)
+
+
+def test_streamlit_interaction_shows_fallback_without_api_key(monkeypatch):
+    """Enter a request, click Generate with no API key -> safe fallback UI."""
+    from streamlit.testing.v1 import AppTest
+
+    import src.pipeline as pipeline
+    from src.ai_client import MissingAPIKeyError
+
+    # Force the offline fallback path deterministically (no key, no network).
+    # Patched before the app runs so the app's fresh import binds this stub.
+    monkeypatch.setattr(
+        pipeline, "generate_recommendations",
+        MagicMock(side_effect=MissingAPIKeyError("no key")),
+    )
+
+    at = AppTest.from_file(str(Path(app.__file__).resolve()))
+    at.run(timeout=30)
+    at.text_area[0].set_value("Play intense rock music for a workout.").run(timeout=30)
+    at.button[0].click().run(timeout=30)
+
+    assert not at.exception  # did not crash
+    text = _apptest_text(at)
+
+    # Parsed preferences are displayed (genre metric = rock).
+    assert "rock" in text.lower()
+    # Fallback transparency is shown with a safe, human message.
+    assert "Safe fallback" in text
+    assert "deterministic matches" in text
+    # No secret, raw exception, or traceback leaks into the UI.
+    assert "sk-" not in text
+    assert "Traceback" not in text
+    assert "ANTHROPIC_API_KEY" not in text
+    assert "no key" not in text  # raw exception message must not appear

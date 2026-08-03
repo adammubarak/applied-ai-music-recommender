@@ -82,36 +82,85 @@ Because: energy similarity (+1.96)
 
 ## Getting Started
 
-### Setup
+### Requirements
 
-1. Create a virtual environment (optional but recommended):
+- **Python 3.10 or newer** (developed and tested on Python 3.13).
 
-   ```bash
-   python -m venv .venv
-   source .venv/bin/activate      # Mac or Linux
-   .venv\Scripts\activate         # Windows
+### 1. Clone the repository
 
-2. Install dependencies
+```bash
+git clone <your-repo-url>
+cd applied-ai-system-final
+```
+
+### 2. Create and activate a virtual environment
+
+**macOS / Linux:**
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+**Windows (PowerShell):**
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+```
+
+### 3. Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-3. Run the app:
+### 4. Configure your API key
+
+Copy the example environment file and add your own Anthropic API key:
 
 ```bash
-python -m src.main
+cp .env.example .env        # Windows: copy .env.example .env
 ```
 
-### Running Tests
+Then edit `.env`:
 
-Run the starter tests with:
+```
+ANTHROPIC_API_KEY=your_real_key_here
+ANTHROPIC_MODEL=claude-sonnet-5
+```
+
+> **Never commit `.env`.** It holds your secret key and is already listed in
+> `.gitignore`. Only `.env.example` (with placeholders) is tracked.
+
+**No key? The app still works.** If `ANTHROPIC_API_KEY` is missing or the AI
+call fails, the application safely falls back to the deterministic
+recommendations instead of crashing.
+
+### 5. Run the Streamlit app
 
 ```bash
-pytest
+python3 -m streamlit run src/app.py
 ```
 
-You can add more tests in `tests/test_recommender.py`.
+Then open the local URL Streamlit prints (default http://localhost:8501).
+
+### 6. (Optional) Run the CLI demo
+
+A minimal deterministic demo over a few sample profiles:
+
+```bash
+python3 -m src.main
+```
+
+### 7. Run the tests
+
+The full suite is offline and mocked — it makes no network or Anthropic API
+calls and needs no API key:
+
+```bash
+python3 -m pytest -q
+```
 
 ---
 
