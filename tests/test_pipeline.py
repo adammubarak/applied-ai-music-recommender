@@ -25,8 +25,11 @@ from src.pipeline import (
     FALLBACK_NO_CANDIDATES,
     FALLBACK_VALIDATION_FAILED,
     DiscoveryResult,
+    RequestDiscoveryResult,
+    discover_from_request,
     discover_music,
 )
+from src.preference_parser import ParsedPreferences
 
 # A catalog larger than retrieval_k so we can prove the full catalog isn't sent.
 SONGS = [
@@ -250,3 +253,68 @@ def test_invalid_inputs_raise():
         discover_music("x", {"mood": "happy"}, SONGS, generation_function=valid_gen_from_retrieved(1))  # missing keys
     with pytest.raises(ValueError):
         discover_music("x", PREFS, SONGS, retrieval_k=0, generation_function=valid_gen_from_retrieved(1))
+
+
+# --- discover_from_request (natural-language entry point) -------------------
+
+def fixed_parser(genre="pop", mood="happy", energy=0.8):
+    parsed = ParsedPreferences(genre=genre, mood=mood, energy=energy,
+                               matched_terms=("pop", "happy"), used_defaults=False)
+    return MagicMock(side_effect=lambda req: parsed), parsed
+
+
+def test_request_entry_point_returns_parse_and_discovery():
+    parser, parsed = fixed_parser()
+    gen = valid_gen_from_retrieved(1)
+    result = discover_from_request(
+        "upbeat pop for the gym", SONGS, retrieval_k=5, output_k=3,
+        parser_function=parser, generation_function=gen,
+    )
+    assert isinstance(result, RequestDiscoveryResult)
+    assert result.parsed_preferences is parsed          # parse included in result
+    assert isinstance(result.discovery, DiscoveryResult)
+    assert result.discovery.source == "ai"
+    parser.assert_called_once_with("upbeat pop for the gym")
+
+
+def test_request_entry_point_passes_parsed_prefs_into_pipeline(monkeypatch):
+    """Delegation: discover_music is called with the parsed canonical prefs."""
+    import src.pipeline as pipeline
+
+    parser, parsed = fixed_parser(genre="rock", mood="intense", energy=0.9)
+    spy = MagicMock(return_value=DiscoveryResult(source="ai", used_fallback=False))
+    monkeypatch.setattr(pipeline, "discover_music", spy)
+
+    gen = valid_gen_from_retrieved(1)
+    result = discover_from_request("x", SONGS, retrieval_k=4, output_k=2,
+                                   parser_function=parser, generation_function=gen)
+
+    # Called exactly once — retrieval/gen/validation/fallback not re-implemented.
+    spy.assert_called_once()
+    call = spy.call_args
+    assert call.args[1] == {"genre": "rock", "mood": "intense", "energy": 0.9}
+    assert call.kwargs["retrieval_k"] == 4
+    assert call.kwargs["output_k"] == 2
+    assert call.kwargs["generation_function"] is gen
+    assert result.discovery is spy.return_value
+
+
+def test_request_entry_point_only_retrieved_songs_reach_generator():
+    parser, _ = fixed_parser()
+    gen = valid_gen_from_retrieved(1)
+    discover_from_request("x", SONGS, retrieval_k=3, parser_function=parser, generation_function=gen)
+
+    _req, passed_retrieved = gen.call_args.args
+    assert len(passed_retrieved) == 3
+    assert len(passed_retrieved) < len(SONGS)
+
+
+def test_request_entry_point_default_parser_is_offline(monkeypatch):
+    """With the real parser and a mocked generator: fully offline, AI path used."""
+    import socket
+    monkeypatch.setattr(socket, "create_connection",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no network")))
+    gen = valid_gen_from_retrieved(1)
+    result = discover_from_request("upbeat pop for the gym", SONGS, generation_function=gen)
+    assert isinstance(result.parsed_preferences, ParsedPreferences)
+    assert result.discovery.source == "ai"

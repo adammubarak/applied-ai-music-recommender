@@ -41,6 +41,7 @@ from .ai_client import (
     RecommendationResult,
     generate_recommendations,
 )
+from .preference_parser import ParsedPreferences, parse_preferences
 from .recommender import recommend_songs
 from .reliability import ValidationReport, validate_recommendations
 
@@ -94,6 +95,16 @@ class DiscoveryResult:
 
 # Type alias for the injected AI generation function.
 GenerationFn = Callable[[str, List[Dict[str, Any]]], RecommendationResult]
+
+# Type alias for the injected preference parser.
+ParserFn = Callable[[str], ParsedPreferences]
+
+
+@dataclass(frozen=True)
+class RequestDiscoveryResult:
+    """Result of the natural-language entry point: the parse plus the discovery."""
+    parsed_preferences: ParsedPreferences
+    discovery: DiscoveryResult
 
 
 # --- Input validation ------------------------------------------------------
@@ -255,3 +266,36 @@ def discover_music(
         ranked, retrieved, output_k, FALLBACK_VALIDATION_FAILED,
         model=result.model, report=report,
     )
+
+
+def discover_from_request(
+    user_request: str,
+    songs: List[Dict[str, Any]],
+    *,
+    retrieval_k: int = 5,
+    output_k: int = 3,
+    parser_function: ParserFn = parse_preferences,
+    generation_function: GenerationFn = generate_recommendations,
+) -> RequestDiscoveryResult:
+    """
+    Natural-language entry point.
+
+    Parses `user_request` into canonical preferences, then delegates to the
+    existing `discover_music()` pipeline (no retrieval/generation/validation/
+    fallback logic is duplicated here). Both parser and generation functions are
+    injectable for offline testing.
+
+    Returns a RequestDiscoveryResult exposing the parsed preferences and the
+    DiscoveryResult produced by discover_music().
+    """
+    parsed = parser_function(user_request)
+    preferences = parsed.to_prefs()
+    discovery = discover_music(
+        user_request,
+        preferences,
+        songs,
+        retrieval_k=retrieval_k,
+        output_k=output_k,
+        generation_function=generation_function,
+    )
+    return RequestDiscoveryResult(parsed_preferences=parsed, discovery=discovery)
