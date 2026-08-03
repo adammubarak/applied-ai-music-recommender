@@ -16,18 +16,19 @@ d. Validate the AI response with `validate_recommendations()`.
 e. Return grounded AI recommendations only if the complete response passed.
 f. Otherwise return safe deterministic fallback recommendations.
 
-Guarantees / non-responsibilities (Phase 4)
--------------------------------------------
+Guarantees / non-responsibilities
+---------------------------------
 The pipeline never: exposes an API key, reads configuration secrets, builds its
 own Anthropic client, loads data/songs.csv, computes a second retrieval score
-(it defers entirely to `recommend_songs()`), includes rejected AI
-recommendations in the final output, depends on Streamlit, or logs anything.
+(it defers entirely to `recommend_songs()`), or includes rejected AI
+recommendations in the final output.
 
-The AI generation function is injected (`generation_function`) so tests stay
-mocked and offline. In production it defaults to `ai_client.generate_recommendations`,
-which owns all configuration/secret handling and lazy client construction.
+Logging is structured and injected (see `logging_config`), non-sensitive, and
+fully contained — a logging failure never changes recommendation behavior. The
+AI generation function is injected so tests stay mocked and offline.
 """
 
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -40,6 +41,19 @@ from .ai_client import (
     MissingAPIKeyError,
     RecommendationResult,
     generate_recommendations,
+)
+from .logging_config import (
+    EVENT_AI_GENERATION_COMPLETED,
+    EVENT_AI_GENERATION_STARTED,
+    EVENT_FALLBACK_USED,
+    EVENT_PIPELINE_COMPLETED,
+    EVENT_PIPELINE_INPUT_ERROR,
+    EVENT_PIPELINE_STARTED,
+    EVENT_PREFERENCES_PARSED,
+    EVENT_RETRIEVAL_COMPLETED,
+    EVENT_VALIDATION_COMPLETED,
+    get_logger,
+    log_event,
 )
 from .preference_parser import ParsedPreferences, parse_preferences
 from .recommender import recommend_songs
@@ -57,8 +71,7 @@ FALLBACK_AI_ERROR = "ai_error"
 FALLBACK_VALIDATION_FAILED = "validation_failed"
 FALLBACK_NO_CANDIDATES = "no_candidates"
 
-# Required keys in the preferences dict for deterministic scoring
-# (matches the canonical schema consumed by recommender.score_song).
+# Required keys in the preferences dict for deterministic scoring.
 REQUIRED_PREF_KEYS = ("genre", "mood", "energy")
 
 
@@ -66,13 +79,7 @@ REQUIRED_PREF_KEYS = ("genre", "mood", "energy")
 
 @dataclass(frozen=True)
 class FinalRecommendation:
-    """
-    One recommendation in the final output, carrying enough for a future UI.
-
-    For AI output, `explanation` is Claude's explanation; for fallback it is the
-    deterministic scoring explanation. `score` is the deterministic score of the
-    song when known (available for every retrieved candidate).
-    """
+    """One recommendation in the final output, carrying enough for a future UI."""
     song_id: Any
     title: str
     artist: str
@@ -91,13 +98,7 @@ class DiscoveryResult:
     fallback_reason: Optional[str] = None          # stable code; never a secret
     validation_report: Optional[ValidationReport] = None
     model: Optional[str] = None
-
-
-# Type alias for the injected AI generation function.
-GenerationFn = Callable[[str, List[Dict[str, Any]]], RecommendationResult]
-
-# Type alias for the injected preference parser.
-ParserFn = Callable[[str], ParsedPreferences]
+    request_id: Optional[str] = None               # correlates log events
 
 
 @dataclass(frozen=True)
@@ -105,9 +106,19 @@ class RequestDiscoveryResult:
     """Result of the natural-language entry point: the parse plus the discovery."""
     parsed_preferences: ParsedPreferences
     discovery: DiscoveryResult
+    request_id: Optional[str] = None
 
 
-# --- Input validation ------------------------------------------------------
+GenerationFn = Callable[[str, List[Dict[str, Any]]], RecommendationResult]
+ParserFn = Callable[[str], ParsedPreferences]
+
+
+# --- Helpers ---------------------------------------------------------------
+
+def _new_request_id() -> str:
+    """Generate a short unique id to correlate one run's events."""
+    return uuid.uuid4().hex
+
 
 def _validate_inputs(
     user_request: str,
@@ -132,8 +143,6 @@ def _validate_inputs(
         raise ValueError("output_k must be a positive integer.")
 
 
-# --- Result builders -------------------------------------------------------
-
 def _build_fallback_result(
     ranked: List[Tuple[Dict[str, Any], float, str]],
     retrieved: List[Dict[str, Any]],
@@ -141,6 +150,7 @@ def _build_fallback_result(
     reason: str,
     model: Optional[str] = None,
     report: Optional[ValidationReport] = None,
+    request_id: Optional[str] = None,
 ) -> DiscoveryResult:
     """Build a DiscoveryResult from the deterministic retrieval results."""
     recs = [
@@ -162,6 +172,7 @@ def _build_fallback_result(
         fallback_reason=reason,
         validation_report=report,
         model=model,
+        request_id=request_id,
     )
 
 
@@ -171,6 +182,7 @@ def _build_ai_result(
     retrieved: List[Dict[str, Any]],
     output_k: int,
     model: Optional[str],
+    request_id: Optional[str] = None,
 ) -> DiscoveryResult:
     """Build a DiscoveryResult from validated AI recommendations."""
     score_by_id = {str(song["id"]): score for song, score, _ in ranked}
@@ -193,6 +205,7 @@ def _build_ai_result(
         fallback_reason=None,
         validation_report=report,
         model=model,
+        request_id=request_id,
     )
 
 
@@ -206,66 +219,136 @@ def discover_music(
     retrieval_k: int = 5,
     output_k: int = 3,
     generation_function: GenerationFn = generate_recommendations,
+    logger: Any = None,
+    request_id: Optional[str] = None,
 ) -> DiscoveryResult:
     """
     Run the end-to-end discovery pipeline.
 
     Args:
         user_request: The user's natural-language music request.
-        preferences: Canonical preferences dict (keys: genre, mood, energy),
-            used by the deterministic scorer.
-        songs: The full song catalog (already loaded by the caller — the
-            pipeline does not read data/songs.csv).
+        preferences: Canonical preferences dict (keys: genre, mood, energy).
+        songs: The full song catalog (already loaded by the caller).
         retrieval_k: How many candidates to retrieve and hand to the AI.
         output_k: Maximum number of recommendations in the final output.
-        generation_function: Injected AI generation function. Defaults to
-            ai_client.generate_recommendations. Injected as a mock in tests.
+        generation_function: Injected AI generation function.
+        logger: Optional logger for structured events (injected; defaults to the
+            shared silent logger so existing callers are unaffected).
+        request_id: Optional correlation id; generated when omitted.
 
     Returns:
         A DiscoveryResult. AI output is used only when the complete response
         passes validation; otherwise a safe deterministic fallback is returned.
     """
-    _validate_inputs(user_request, preferences, songs, retrieval_k, output_k)
+    logger = logger or get_logger()
+    request_id = request_id or _new_request_id()
+
+    req_is_str = isinstance(user_request, str)
+    log_event(
+        logger, EVENT_PIPELINE_STARTED,
+        request_id=request_id,
+        request_chars=len(user_request) if req_is_str else 0,
+        request_empty=(not (req_is_str and user_request.strip())),
+        retrieval_k=retrieval_k,
+        output_k=output_k,
+        genre=preferences.get("genre") if isinstance(preferences, dict) else None,
+        mood=preferences.get("mood") if isinstance(preferences, dict) else None,
+        energy=preferences.get("energy") if isinstance(preferences, dict) else None,
+    )
+
+    try:
+        _validate_inputs(user_request, preferences, songs, retrieval_k, output_k)
+    except ValueError as exc:
+        # Our own, non-sensitive validation messages only.
+        log_event(logger, EVENT_PIPELINE_INPUT_ERROR, request_id=request_id, detail=str(exc))
+        raise
 
     # b. Deterministic retrieval — single source of truth for scoring.
     ranked = recommend_songs(preferences, songs, k=retrieval_k)
     retrieved = [song for song, _score, _explanation in ranked]
+    retrieved_ids = [song["id"] for song in retrieved]
+
+    log_event(
+        logger, EVENT_RETRIEVAL_COMPLETED,
+        request_id=request_id,
+        retrieved_count=len(retrieved),
+        retrieved_ids=retrieved_ids,
+        retrieval_k=retrieval_k,
+    )
+
+    def _finish_fallback(reason: str, model=None, report=None) -> DiscoveryResult:
+        log_event(logger, EVENT_FALLBACK_USED, request_id=request_id, reason=reason)
+        obj = _build_fallback_result(
+            ranked, retrieved, output_k, reason,
+            model=model, report=report, request_id=request_id,
+        )
+        log_event(
+            logger, EVENT_PIPELINE_COMPLETED,
+            request_id=request_id, source=obj.source, used_fallback=True,
+            output_count=len(obj.final_recommendations),
+            fallback_reason=reason, model=model,
+        )
+        return obj
+
+    def _finish_ai(report: ValidationReport, model) -> DiscoveryResult:
+        obj = _build_ai_result(report, ranked, retrieved, output_k, model, request_id)
+        log_event(
+            logger, EVENT_PIPELINE_COMPLETED,
+            request_id=request_id, source=obj.source, used_fallback=False,
+            output_count=len(obj.final_recommendations),
+            reliability_score=report.reliability_score, model=model,
+        )
+        return obj
 
     # Safe handling when there is nothing to ground on.
     if not retrieved:
-        return _build_fallback_result(
-            ranked, retrieved, output_k, reason=FALLBACK_NO_CANDIDATES
-        )
+        return _finish_fallback(FALLBACK_NO_CANDIDATES)
 
     # c. Generation on retrieved candidates only. Any AI failure -> fallback.
+    log_event(
+        logger, EVENT_AI_GENERATION_STARTED,
+        request_id=request_id, candidate_count=len(retrieved),
+    )
     try:
         result = generation_function(user_request, retrieved)
     except MissingAPIKeyError:
-        return _build_fallback_result(ranked, retrieved, output_k, FALLBACK_MISSING_API_KEY)
+        return _finish_fallback(FALLBACK_MISSING_API_KEY)
     except APICallError:
-        return _build_fallback_result(ranked, retrieved, output_k, FALLBACK_API_ERROR)
+        return _finish_fallback(FALLBACK_API_ERROR)
     except EmptyResponseError:
-        return _build_fallback_result(ranked, retrieved, output_k, FALLBACK_EMPTY_RESPONSE)
+        return _finish_fallback(FALLBACK_EMPTY_RESPONSE)
     except MalformedResponseError:
-        return _build_fallback_result(ranked, retrieved, output_k, FALLBACK_MALFORMED_JSON)
+        return _finish_fallback(FALLBACK_MALFORMED_JSON)
     except InvalidResponseStructureError:
-        return _build_fallback_result(ranked, retrieved, output_k, FALLBACK_INVALID_STRUCTURE)
+        return _finish_fallback(FALLBACK_INVALID_STRUCTURE)
     except AIClientError:
-        # Any other AI client error — stay safe.
-        return _build_fallback_result(ranked, retrieved, output_k, FALLBACK_AI_ERROR)
+        return _finish_fallback(FALLBACK_AI_ERROR)
+
+    log_event(
+        logger, EVENT_AI_GENERATION_COMPLETED,
+        request_id=request_id,
+        recommendation_count=len(result.recommendations),
+        model=result.model,
+    )
 
     # d. Validate against the retrieved set.
     report = validate_recommendations(result, retrieved)
+    log_event(
+        logger, EVENT_VALIDATION_COMPLETED,
+        request_id=request_id,
+        total_requested=report.total_requested,
+        valid_count=report.valid_count,
+        rejected_count=len(report.rejected),
+        reliability_score=report.reliability_score,
+        passed=report.passed,
+    )
 
     # e. Use AI output only if the complete response passed.
     if report.passed:
-        return _build_ai_result(report, ranked, retrieved, output_k, result.model)
+        return _finish_ai(report, result.model)
 
     # f. Otherwise, safe deterministic fallback (no second AI call).
-    return _build_fallback_result(
-        ranked, retrieved, output_k, FALLBACK_VALIDATION_FAILED,
-        model=result.model, report=report,
-    )
+    return _finish_fallback(FALLBACK_VALIDATION_FAILED, model=result.model, report=report)
 
 
 def discover_from_request(
@@ -276,26 +359,39 @@ def discover_from_request(
     output_k: int = 3,
     parser_function: ParserFn = parse_preferences,
     generation_function: GenerationFn = generate_recommendations,
+    logger: Any = None,
+    request_id: Optional[str] = None,
 ) -> RequestDiscoveryResult:
     """
     Natural-language entry point.
 
     Parses `user_request` into canonical preferences, then delegates to the
     existing `discover_music()` pipeline (no retrieval/generation/validation/
-    fallback logic is duplicated here). Both parser and generation functions are
-    injectable for offline testing.
-
-    Returns a RequestDiscoveryResult exposing the parsed preferences and the
-    DiscoveryResult produced by discover_music().
+    fallback logic is duplicated here). A single request_id correlates the
+    parse event with the discovery events.
     """
+    logger = logger or get_logger()
+    request_id = request_id or _new_request_id()
+
     parsed = parser_function(user_request)
-    preferences = parsed.to_prefs()
+    log_event(
+        logger, EVENT_PREFERENCES_PARSED,
+        request_id=request_id,
+        genre=parsed.genre, mood=parsed.mood, energy=parsed.energy,
+        used_defaults=parsed.used_defaults,
+        matched_terms_count=len(parsed.matched_terms),
+    )
+
     discovery = discover_music(
         user_request,
-        preferences,
+        parsed.to_prefs(),
         songs,
         retrieval_k=retrieval_k,
         output_k=output_k,
         generation_function=generation_function,
+        logger=logger,
+        request_id=request_id,
     )
-    return RequestDiscoveryResult(parsed_preferences=parsed, discovery=discovery)
+    return RequestDiscoveryResult(
+        parsed_preferences=parsed, discovery=discovery, request_id=request_id
+    )

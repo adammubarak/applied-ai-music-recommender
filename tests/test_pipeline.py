@@ -318,3 +318,178 @@ def test_request_entry_point_default_parser_is_offline(monkeypatch):
     result = discover_from_request("upbeat pop for the gym", SONGS, generation_function=gen)
     assert isinstance(result.parsed_preferences, ParsedPreferences)
     assert result.discovery.source == "ai"
+
+
+# --- Logging integration ---------------------------------------------------
+
+import logging  # noqa: E402
+
+
+class _ListHandler(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.messages = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+
+def make_capturing_logger():
+    logger = logging.getLogger("test-capture-" + str(id(object())))
+    logger.handlers = []
+    handler = _ListHandler()
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    return logger, handler
+
+
+def events_of(handler):
+    """Extract the event name from each captured message."""
+    out = []
+    for m in handler.messages:
+        assert m.startswith("event=")
+        out.append(m.split(" ", 1)[0].split("=", 1)[1])
+    return out
+
+
+def field_in(handler, event, key):
+    """Return the value of `key` in the first message for `event`, else None."""
+    for m in handler.messages:
+        if m.startswith(f"event={event} ") or m == f"event={event}":
+            for tok in m.split(" "):
+                if tok.startswith(key + "="):
+                    return tok.split("=", 1)[1]
+    return None
+
+
+def test_ai_path_logs_expected_events():
+    logger, handler = make_capturing_logger()
+    gen = valid_gen_from_retrieved(1)
+    discover_music("upbeat pop", PREFS, SONGS, retrieval_k=3, output_k=3,
+                   generation_function=gen, logger=logger)
+    ev = events_of(handler)
+    assert "pipeline_started" in ev
+    assert "retrieval_completed" in ev
+    assert "ai_generation_started" in ev
+    assert "ai_generation_completed" in ev
+    assert "validation_completed" in ev
+    assert "pipeline_completed" in ev
+    assert "fallback_used" not in ev
+
+
+def test_fallback_path_logs_fallback_event_with_stable_reason():
+    logger, handler = make_capturing_logger()
+    gen = MagicMock(side_effect=APICallError("boom"))
+    discover_music("x", PREFS, SONGS, generation_function=gen, logger=logger)
+    ev = events_of(handler)
+    assert "fallback_used" in ev
+    assert field_in(handler, "fallback_used", "reason") == FALLBACK_API_ERROR
+
+
+def test_parsed_preference_event_logged():
+    logger, handler = make_capturing_logger()
+    parser, _ = fixed_parser(genre="rock", mood="intense", energy=0.9)
+    gen = valid_gen_from_retrieved(1)
+    discover_from_request("x", SONGS, parser_function=parser,
+                          generation_function=gen, logger=logger)
+    assert "preferences_parsed" in events_of(handler)
+    assert field_in(handler, "preferences_parsed", "genre") == "rock"
+
+
+def test_retrieval_ids_and_counts_logged():
+    logger, handler = make_capturing_logger()
+    gen = valid_gen_from_retrieved(1)
+    discover_music("x", PREFS, SONGS, retrieval_k=3, generation_function=gen, logger=logger)
+    assert field_in(handler, "retrieval_completed", "retrieved_count") == "3"
+    ids = field_in(handler, "retrieval_completed", "retrieved_ids")
+    assert ids is not None and len(ids.split(",")) == 3
+
+
+def test_validation_counts_and_score_logged():
+    logger, handler = make_capturing_logger()
+    gen = valid_gen_from_retrieved(2)
+    discover_music("x", PREFS, SONGS, retrieval_k=5, generation_function=gen, logger=logger)
+    assert field_in(handler, "validation_completed", "valid_count") == "2"
+    assert field_in(handler, "validation_completed", "reliability_score") == "1.0"
+
+
+def test_request_id_appears_across_events():
+    logger, handler = make_capturing_logger()
+    gen = valid_gen_from_retrieved(1)
+    discover_music("x", PREFS, SONGS, generation_function=gen, logger=logger,
+                   request_id="fixed-run-id")
+    # Every event carries the same id.
+    assert len(handler.messages) > 0
+    for m in handler.messages:
+        assert "request_id=fixed-run-id" in m
+
+
+def test_complete_user_request_not_logged():
+    logger, handler = make_capturing_logger()
+    secret_text = "PLEASE_DO_NOT_LOG_THIS_UNIQUE_REQUEST_TEXT"
+    gen = valid_gen_from_retrieved(1)
+    discover_music(secret_text, PREFS, SONGS, generation_function=gen, logger=logger)
+    for m in handler.messages:
+        assert secret_text not in m
+    # But metadata about the request is present.
+    assert field_in(handler, "pipeline_started", "request_chars") == str(len(secret_text))
+
+
+def test_raw_api_exception_message_not_logged():
+    logger, handler = make_capturing_logger()
+    gen = MagicMock(side_effect=APICallError("sk-ant-leak-me-and-stacktrace"))
+    discover_music("x", PREFS, SONGS, generation_function=gen, logger=logger)
+    for m in handler.messages:
+        assert "sk-ant-leak-me-and-stacktrace" not in m
+        assert "leak-me" not in m
+
+
+def test_injected_logger_receives_events():
+    logger, handler = make_capturing_logger()
+    gen = valid_gen_from_retrieved(1)
+    discover_music("x", PREFS, SONGS, generation_function=gen, logger=logger)
+    assert len(handler.messages) > 0
+
+
+def test_failing_logger_does_not_break_pipeline():
+    bad = MagicMock()
+    bad.log.side_effect = RuntimeError("logger down")
+    gen = valid_gen_from_retrieved(1)
+    result = discover_music("x", PREFS, SONGS, generation_function=gen, logger=bad)
+    assert result.source == "ai"
+    assert len(result.final_recommendations) == 1
+
+
+def test_results_unchanged_by_logging():
+    gen1 = valid_gen_from_retrieved(1)
+    without = discover_music("x", PREFS, SONGS, retrieval_k=5, output_k=3, generation_function=gen1)
+
+    logger, _ = make_capturing_logger()
+    gen2 = valid_gen_from_retrieved(1)
+    with_log = discover_music("x", PREFS, SONGS, retrieval_k=5, output_k=3,
+                              generation_function=gen2, logger=logger)
+
+    assert without.source == with_log.source
+    assert [(r.song_id, r.title, r.score) for r in without.final_recommendations] == \
+           [(r.song_id, r.title, r.score) for r in with_log.final_recommendations]
+
+
+def test_request_id_exposed_in_results():
+    gen = valid_gen_from_retrieved(1)
+    d = discover_music("x", PREFS, SONGS, generation_function=gen, request_id="rid-1")
+    assert d.request_id == "rid-1"
+
+    parser, _ = fixed_parser()
+    r = discover_from_request("x", SONGS, parser_function=parser,
+                              generation_function=valid_gen_from_retrieved(1), request_id="rid-2")
+    assert r.request_id == "rid-2"
+    assert r.discovery.request_id == "rid-2"
+
+
+def test_input_error_event_logged():
+    logger, handler = make_capturing_logger()
+    gen = valid_gen_from_retrieved(1)
+    with pytest.raises(ValueError):
+        discover_music("x", {"mood": "happy"}, SONGS, generation_function=gen, logger=logger)
+    assert "pipeline_input_error" in events_of(handler)
