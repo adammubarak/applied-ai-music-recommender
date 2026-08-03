@@ -1,1 +1,85 @@
-%% Applied AI system architecture diagram
+%% Explainable AI Music Discovery Assistant - system architecture
+%% RAG boundary: Claude receives ONLY the retrieved candidate songs,
+%% never the full data/songs.csv catalog.
+%% Guardrails (two stages):
+%%  1. Generation failures (missing key, API failure, malformed, empty,
+%%     invalid structure) bypass the validator and go straight to fallback.
+%%  2. A structured response is validated against the retrieved candidates;
+%%     only fully valid picks become grounded AI output. Rejected AI
+%%     recommendations never reach the user.
+flowchart TD
+
+    subgraph UI["User Interface"]
+        USER([Human user])
+        APP[Streamlit UI]
+        REVIEW([Human review of recommendations])
+    end
+
+    subgraph CORE["Core Application Pipeline"]
+        PARSER[NL preference parser]
+        PIPE[Pipeline orchestrator]
+        RETR[Deterministic retriever and scorer]
+        GENOK{Generation succeeded?}
+        DECIDE{Validation passed?}
+        AIOUT[Grounded AI recommendations]
+        FALLBACK[Deterministic fallback recommendations]
+    end
+
+    subgraph DATA["Data and AI Services"]
+        CSV[(data/songs.csv catalog)]
+        CAND[Retrieved candidate songs]
+        CLAUDE[Claude AI client]
+    end
+
+    subgraph REL["Reliability and Evaluation"]
+        VALID[Reliability validator]
+        LOG[[Structured logging]]
+        TESTS[/Automated test suite/]
+    end
+
+    %% Main request flow
+    USER -->|natural-language request| APP
+    APP -->|request text| PARSER
+    PARSER -->|genre, mood, energy| PIPE
+    PIPE --> RETR
+
+    %% RAG boundary: catalog -> retriever -> top-k -> Claude only
+    CSV -->|all songs| RETR
+    RETR -->|top-k only| CAND
+    CAND -->|only retrieved songs| CLAUDE
+
+    %% Stage 1 guardrail: did generation succeed at all?
+    CLAUDE --> GENOK
+    GENOK -->|no: missing key / API failure / malformed / empty / invalid structure| FALLBACK
+
+    %% Stage 2 guardrail: validate the structured response against candidates
+    GENOK -->|yes: structured response| VALID
+    CAND -->|ground-truth set| VALID
+    VALID --> DECIDE
+    DECIDE -->|all recommendations valid| AIOUT
+    DECIDE -->|invented / mismatched / duplicate / rejected| FALLBACK
+
+    %% Fallback is built from the deterministic retrieved candidates
+    CAND -->|deterministic top-k with scores| FALLBACK
+
+    %% Display and human review
+    AIOUT -->|grounded output| APP
+    FALLBACK -->|safe output| APP
+    APP -->|displayed recommendations| REVIEW
+
+    %% Logging observes the pipeline (safe events only)
+    PIPE -.->|safe events: parse, retrieval, generation, validation, fallback, completion| LOG
+
+    %% Automated tests check components offline
+    TESTS -.->|mocked, offline| CORE
+    TESTS -.->|mock client, no live API call| CLAUDE
+    TESTS -.->|verify grounding| VALID
+    TESTS -.->|render and smoke test| APP
+
+    classDef guardrail fill:#fff3cd,stroke:#b8860b,color:#000;
+    classDef fallback fill:#f8d7da,stroke:#a94442,color:#000;
+    classDef ai fill:#d4edda,stroke:#2e7d32,color:#000;
+    class GENOK guardrail;
+    class DECIDE guardrail;
+    class FALLBACK fallback;
+    class AIOUT ai;
